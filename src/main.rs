@@ -88,6 +88,7 @@ async fn run(cli: Cli) -> Result<()> {
         backoff_max_ms: cli.backoff_max_ms,
         min_speed: cli.min_speed,
         min_speed_window_secs: cli.min_speed_window,
+        retry_max_secs: cli.retry_max_secs,
     };
 
     match probed {

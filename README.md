@@ -45,7 +45,8 @@ Common options:
 | `-c, --connections <N>` | `8` | Parallel connections (workers). |
 | `-s, --chunk-size <SIZE>` | `8M` | Range chunk size (`4M`, `512K`, `1048576`). |
 | `--max-buffered <N>` | `= 2 × connections` | Max chunks held in memory; peak memory `~= N * chunk_size`. The read-ahead keeps one slow chunk from stalling the in-order writer. |
-| `-r, --retries <N>` | `20` | Per-chunk retry attempts after the first failure; sized so a transient origin/CDN blip does not abort a long transfer. |
+| `-r, --retries <N>` | `20` | Per-chunk retry attempts; used only when `--retry-max-secs 0`. |
+| `--retry-max-secs <SECS>` | `300` | Per-chunk wall-clock retry budget: a chunk keeps retrying a transient failure until this elapses, so a fast-refusing outage does not abort the run as quickly as a fixed attempt count (`0` = use `--retries`). |
 | `-t, --timeout <SECS>` | `60` | Connect + idle (read) timeout; resets per read, so it bounds stalls without killing a slow transfer (`0` disables). |
 | `--min-speed <SIZE>` | `8K` | Minimum sustained per-chunk speed; a chunk below it for ~15s is dropped and retried so a trickling connection cannot wedge the stream (`0` disables). Raise it (e.g. `1M`) on a fast link to re-dispatch merely-slow edges. |
 | `-o, --output <FILE>` | stdout | Write to a file instead of stdout. |

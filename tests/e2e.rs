@@ -148,6 +148,18 @@ fn min_speed_floor_redispatches_trickling_chunk() {
 }
 
 #[test]
+fn soft_status_retry_recovers_from_transient_200() {
+    let _g = common::serial_guard();
+    // A flaky edge answers each range with 200 (range ignored) on first sight,
+    // then the correct 206 on retry. The bounded soft-status retry must absorb
+    // it instead of instantly aborting, yielding byte-exact output.
+    let data = random_bytes(256 * 1024, 9);
+    let server = TestServer::start(data.clone(), Mode::FlakyStatus200);
+    let got = run_capture(&server.url, &["-c", "4", "-s", "64K"]);
+    assert_bytes_eq(&got, &data, "soft_status_retry");
+}
+
+#[test]
 fn http2_flag_downloads_byte_exact() {
     let _g = common::serial_guard();
     // Exercises the --http2 client-build branch (which skips http1_only). The

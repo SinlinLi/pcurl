@@ -56,7 +56,10 @@ pub struct Cli {
     pub min_speed: u64,
 
     /// Window in seconds over which `--min-speed` is averaged before a chunk is
-    /// judged too slow. A shorter window reacts faster but tolerates less jitter.
+    /// judged too slow. To re-dispatch a merely-slow (not fully stalled) edge,
+    /// set this shorter than a healthy chunk's transfer time
+    /// (~ chunk-size / per-connection speed) and raise --min-speed; the default
+    /// is tuned to catch stalled/trickling connections, not merely-slow ones.
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub min_speed_window: u64,
 
@@ -67,6 +70,15 @@ pub struct Cli {
     /// Maximum backoff in milliseconds.
     #[arg(long, default_value_t = 10_000)]
     pub backoff_max_ms: u64,
+
+    /// Per-chunk wall-clock retry budget in seconds; a chunk keeps retrying a
+    /// transient failure until this elapses (0 = use the --retries count
+    /// instead). This is the real resilience knob for long unattended
+    /// transfers: it bounds how long an outage one chunk can ride out
+    /// regardless of how fast each attempt fails, so a fast-refusing outage
+    /// does not abort the run as quickly as a fixed attempt count would.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(0..=86_400))]
+    pub retry_max_secs: u64,
 
     /// Write to this file instead of stdout.
     #[arg(short = 'o', long)]

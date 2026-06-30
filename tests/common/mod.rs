@@ -50,6 +50,10 @@ pub enum Mode {
     /// the 206 body far below any sane `--min-speed`, then serves it at full
     /// speed on retry (exercises the throughput floor re-dispatching a chunk).
     TrickleFirstChunk,
+    /// Like Range, but the first time it sees each distinct range it answers
+    /// 200 (range ignored, as a flaky edge during failover would), then the
+    /// correct 206 on retry (exercises the bounded soft-status retry).
+    FlakyStatus200,
 }
 
 pub struct TestServer {
@@ -200,6 +204,22 @@ fn handle_request(
                 // served at full speed.
                 if !is_probe && seen.lock().unwrap().insert((start, end)) {
                     trickle_range(request, data, start, end, total);
+                } else {
+                    respond_range(request, data, start, end, total);
+                }
+            }
+            None => respond_full_200(request, data, true),
+        },
+        Mode::FlakyStatus200 => match range {
+            Some((start, end)) => {
+                // First sight of a real chunk: answer 200 (range ignored) like a
+                // flaky edge; serve the correct 206 on retry.
+                if !is_probe && seen.lock().unwrap().insert((start, end)) {
+                    let _ = request.respond(
+                        Response::from_data(data.to_vec())
+                            .with_status_code(200)
+                            .with_header(header("Connection", "close")),
+                    );
                 } else {
                     respond_range(request, data, start, end, total);
                 }

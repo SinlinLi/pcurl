@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use reqwest::header::RANGE;
+use reqwest::header::{RANGE, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Semaphore;
@@ -26,6 +26,15 @@ use crate::writer::ChunkMsg;
 /// body arrives; this only caps the initial reservation.
 const MAX_PREALLOC: u64 = 16 * 1024 * 1024;
 
+/// How many times a normally non-retryable status (a momentary 200/403/4xx from
+/// one flaky edge during a failover) is retried before it is treated as fatal.
+/// A genuinely unsupported/forbidden resource still fails after a few seconds.
+const SOFT_STATUS_RETRIES: u32 = 3;
+
+/// Cap on how long a server's `Retry-After` is honoured, so a hostile or absurd
+/// value cannot stall a chunk indefinitely.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
 /// Retry / backoff policy for a single chunk.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryCfg {
@@ -38,6 +47,12 @@ pub struct RetryCfg {
     pub min_speed: u64,
     /// Window in seconds over which `min_speed` is averaged.
     pub min_speed_window_secs: u64,
+    /// Wall-clock retry budget per chunk in seconds; `0` falls back to the
+    /// count-based `retries` bound. When set, a chunk keeps retrying transient
+    /// failures until this elapses, so a fast-failing outage (connection
+    /// refused / immediate 5xx) gets minutes of tolerance instead of being
+    /// capped at the sum of the backoffs.
+    pub retry_max_secs: u64,
 }
 
 impl RetryCfg {
@@ -183,7 +198,8 @@ async fn worker(
 /// Reason a single fetch attempt failed.
 enum FetchError {
     /// The server replied with an unexpected status code (body dropped unread).
-    Status(StatusCode),
+    /// Carries the parsed `Retry-After` delay if the server advertised one.
+    Status(StatusCode, Option<Duration>),
     /// A transport, timeout, or body-read error.
     Transport(anyhow::Error),
 }
@@ -205,11 +221,16 @@ async fn fetch_chunk(
     retry: &RetryCfg,
     token: &CancellationToken,
 ) -> Result<Bytes> {
+    let started = Instant::now();
     let mut attempt = 0u32;
+    // A momentary 200/403/4xx from one flaky edge should not instantly abort a
+    // long run; count those separately and only declare them fatal after a few.
+    let mut soft_status = 0u32;
     loop {
         if token.is_cancelled() {
             bail!("cancelled");
         }
+        let mut retry_after: Option<Duration> = None;
         let last_err: anyhow::Error = match try_fetch(
             client,
             url,
@@ -224,25 +245,50 @@ async fn fetch_chunk(
             Ok(bytes) if bytes.len() as u64 == expected => return Ok(bytes),
             Ok(bytes) => anyhow!("short read: got {} bytes, expected {expected}", bytes.len()),
             Err(FetchError::Transport(e)) => e,
-            Err(FetchError::Status(s)) if is_retryable_status(s) => {
+            Err(FetchError::Status(s, ra)) if is_retryable_status(s) => {
+                retry_after = ra;
                 anyhow!("server returned {s}")
             }
-            Err(FetchError::Status(s)) => {
-                // Not retryable: fail fast with actionable guidance.
-                if s == StatusCode::OK {
-                    bail!(
-                        "server ignored the byte range and returned 200 (full body); \
-                         it does not support ranges here — re-run with --single"
-                    );
+            Err(FetchError::Status(s, _)) => {
+                // Not classically retryable, but a brief 200/403/4xx from a
+                // single edge during a failover should be absorbed. Give it a
+                // few attempts; a genuinely unsupported/forbidden resource then
+                // fails fast with actionable guidance.
+                soft_status += 1;
+                if soft_status > SOFT_STATUS_RETRIES {
+                    if s == StatusCode::OK {
+                        bail!(
+                            "server ignored the byte range and returned 200 (full body); \
+                             it does not support ranges here — re-run with --single"
+                        );
+                    }
+                    bail!("server returned non-retryable status {s} for the range request");
                 }
-                bail!("server returned non-retryable status {s} for the range request");
+                anyhow!("server returned {s} (transient? retrying)")
             }
         };
 
-        if attempt >= retry.retries {
-            return Err(last_err.context(format!("giving up after {} attempts", attempt + 1)));
+        // Budget: wall-clock when retry_max_secs is set (default), else count.
+        let exhausted = if retry.retry_max_secs > 0 {
+            started.elapsed().as_secs() >= retry.retry_max_secs
+        } else {
+            attempt >= retry.retries
+        };
+        if exhausted {
+            return Err(last_err.context(format!(
+                "giving up after {} attempts over {:.0?}",
+                attempt + 1,
+                started.elapsed()
+            )));
         }
-        let delay = retry.backoff(attempt);
+
+        // Honour Retry-After (clamped) when present, but never wait less than
+        // the computed backoff.
+        let backoff = retry.backoff(attempt);
+        let delay = match retry_after {
+            Some(ra) => ra.min(MAX_RETRY_AFTER).max(backoff),
+            None => backoff,
+        };
         tracing::debug!(start, end, attempt, ?delay, error = %last_err, "retrying chunk");
         tokio::select! {
             _ = token.cancelled() => bail!("cancelled"),
@@ -279,36 +325,46 @@ async fn try_fetch(
 
     let status = resp.status();
     if status != StatusCode::PARTIAL_CONTENT {
-        // Drop the body unread; never buffer a potentially huge 200 body.
-        return Err(FetchError::Status(status));
+        // Capture Retry-After (delta-seconds form) before dropping the body
+        // unread; never buffer a potentially huge 200 body.
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        return Err(FetchError::Status(status, retry_after));
     }
 
     let mut stream = resp.bytes_stream();
     let mut buf = BytesMut::with_capacity(expected.min(MAX_PREALLOC) as usize);
-    // Start the throughput window on the first body frame, not here: the gap
+    // Start the throughput clock on the first body frame, not here: the gap
     // until first byte (connection warm-up, a cold-storage range assemble) is
     // not transfer-rate and must not be charged against `min_speed`.
-    let mut window_start: Option<Instant> = None;
-    let mut window_bytes: u64 = 0;
-    let min_per_window = min_speed.saturating_mul(window.as_secs());
+    let mut started: Option<Instant> = None;
+    let mut received: u64 = 0;
 
     while let Some(item) = stream.next().await {
         let bytes = item.map_err(|e| {
             FetchError::Transport(anyhow::Error::new(e).context("reading chunk body"))
         })?;
-        window_bytes = window_bytes.saturating_add(bytes.len() as u64);
+        received = received.saturating_add(bytes.len() as u64);
         buf.extend_from_slice(&bytes);
 
-        let start = *window_start.get_or_insert_with(Instant::now);
-        if min_speed > 0 && start.elapsed() >= window {
-            if window_bytes < min_per_window {
+        // After the chunk has been transferring for at least `window` seconds,
+        // require its cumulative average rate to stay at or above `min_speed`;
+        // otherwise drop it so the retry loop re-dispatches it (usually onto a
+        // fresh connection). Sampling only after the warm-up window avoids
+        // judging a chunk on a tiny initial sample, and the cumulative average
+        // forgives a brief dip that recovers.
+        if min_speed > 0 {
+            let elapsed = started.get_or_insert_with(Instant::now).elapsed();
+            if elapsed >= window && (received as f64) < min_speed as f64 * elapsed.as_secs_f64() {
                 return Err(FetchError::Transport(anyhow!(
-                    "chunk too slow: {window_bytes} bytes in {}s is below --min-speed ({min_speed} B/s)",
-                    window.as_secs(),
+                    "chunk too slow: {received} bytes in {:.0?} is below --min-speed ({min_speed} B/s)",
+                    elapsed,
                 )));
             }
-            window_start = Some(Instant::now());
-            window_bytes = 0;
         }
     }
 
