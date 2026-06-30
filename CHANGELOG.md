@@ -5,10 +5,9 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/). While the version is `0.x`, the CLI
 and behavior may change between minor releases.
 
-## [Unreleased]
+## [0.1.0] - 2026-06-30
 
-First public release. When you tag, rename this section to
-`## [0.1.0] - YYYY-MM-DD`.
+First public release.
 
 ### Added
 
