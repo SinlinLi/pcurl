@@ -4,8 +4,6 @@
 
 [![CI](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml/badge.svg)](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/SinlinLi/pcurl)](https://github.com/SinlinLi/pcurl/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**状态:** 早期(0.x)· Linux x86_64/aarch64 · 流式输出到 stdout,设计上不支持续传。
-
 并行 HTTP 下载器,严格按顺序流式输出到 stdout,可直接管道喂给解压器。
 
 ```sh
