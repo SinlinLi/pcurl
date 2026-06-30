@@ -2,6 +2,10 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · **Español**
 
+[![CI](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml/badge.svg)](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/SinlinLi/pcurl)](https://github.com/SinlinLi/pcurl/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**Estado:** temprano (0.x) · Linux x86_64/aarch64 · transmite a stdout, sin reanudación por diseño.
+
 Descargador HTTP paralelo que transmite a stdout en orden estricto, listo para
 canalizar directamente a un descompresor.
 

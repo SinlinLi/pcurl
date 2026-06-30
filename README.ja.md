@@ -2,6 +2,10 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · **日本語** · [한국어](README.ko.md) · [Español](README.es.md)
 
+[![CI](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml/badge.svg)](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/SinlinLi/pcurl)](https://github.com/SinlinLi/pcurl/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**ステータス:** 初期段階（0.x）· Linux x86_64/aarch64 · stdout へストリーミング、設計上レジュームなし。
+
 stdout へ厳密に順序どおりストリーミングする並列 HTTP ダウンローダー。展開コマンドへ
 そのままパイプできます。
 

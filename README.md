@@ -2,6 +2,10 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md)
 
+[![CI](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml/badge.svg)](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/SinlinLi/pcurl)](https://github.com/SinlinLi/pcurl/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**Status:** early (0.x) · Linux x86_64/aarch64 · streams to stdout, no resume by design.
+
 Parallel HTTP downloader that streams strictly in order to stdout, ready to pipe
 straight into a decompressor.
 

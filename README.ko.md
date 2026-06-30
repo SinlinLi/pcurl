@@ -2,6 +2,10 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · **한국어** · [Español](README.es.md)
 
+[![CI](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml/badge.svg)](https://github.com/SinlinLi/pcurl/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/SinlinLi/pcurl)](https://github.com/SinlinLi/pcurl/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**상태:** 초기 단계(0.x) · Linux x86_64/aarch64 · stdout으로 스트리밍, 설계상 재개 없음.
+
 stdout으로 엄격히 순서대로 스트리밍하는 병렬 HTTP 다운로더. 압축 해제기로 바로 파이프할
 수 있습니다.
 
