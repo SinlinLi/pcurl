@@ -102,8 +102,16 @@ output pipe is success only when the producer did not also error (so a real
 download failure is not masked by the consumer closing the pipe);
 `WriterOutcome::Incomplete` (channel closed before every chunk arrived) is exit
 1. In a shell pipeline, callers must use `set -o pipefail` to see pcurl's status.
-`panic = "abort"` (release): a task panic aborts the process; the
-"task panicked" `JoinError` branches are effectively debug/test-only.
+Release builds use `panic = "unwind"`, so a panic in the `spawn_blocking` writer
+or a worker is caught as a `JoinError` and reported as a clean exit-1 (not
+SIGABRT). A termination signal (SIGINT/SIGTERM, handled in `main.rs`) cancels the
+run, logs an attributable message, and forces exit 130 via the `INTERRUPTED`
+flag — there is no resume, so an interrupted run must be restarted.
+
+The single-stream fallback (`run_single_stream`) verifies the received byte
+count against the probed `Content-Length` and reports a short body as an error,
+so a transfer truncated by an early connection close is not mistaken for success
+(a body with no `Content-Length` is close-delimited and cannot be checked).
 
 ## Adding a fetch/retry/throughput behavior
 

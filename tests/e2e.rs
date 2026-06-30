@@ -4,6 +4,9 @@
 mod common;
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use common::{Mode, TestServer};
 use rand::rngs::StdRng;
@@ -262,6 +265,87 @@ fn range_answered_with_200_fails_fast() {
     assert!(
         elapsed.as_secs() < 15,
         "should fail fast on a non-retryable 200, took {elapsed:?}"
+    );
+}
+
+/// A raw TCP server that answers every request with a 200 advertising the full
+/// `Content-Length` but sends only the first half of `body`, then closes the
+/// connection — a transfer truncated mid-body with a known length. (tiny_http
+/// uses close-delimited framing under `Connection: close`, which omits
+/// Content-Length, so a raw socket is needed to reproduce this case.)
+fn spawn_truncating_server(body: Vec<u8>) -> (String, TruncStop) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/file", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        let full = body.len();
+        let half = &body[..full / 2];
+        while !stop_thread.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = sock.read(&mut [0u8; 1024]); // drain request line/headers
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {full}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(half);
+                    let _ = sock.flush();
+                    // Drop `sock`: closes mid-body, having sent only half of the
+                    // advertised Content-Length.
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (
+        url,
+        TruncStop {
+            stop,
+            handle: Some(handle),
+        },
+    )
+}
+
+struct TruncStop {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TruncStop {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[test]
+fn single_stream_truncation_is_detected() {
+    // The origin advertises the full Content-Length but sends only half the body
+    // then closes the connection. A single-stream download must report this as a
+    // failure, not a silent exit 0 with a truncated stream.
+    let _g = common::serial_guard();
+    let data = random_bytes(256 * 1024, 21);
+    let (url, _server) = spawn_truncating_server(data);
+    let out = Command::new(BIN)
+        .arg(&url)
+        .args(["-q", "-t", "3"])
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("spawn pcurl");
+    assert!(
+        !out.status.success(),
+        "expected nonzero exit on a truncated single-stream body, got {:?}",
+        out.status.code()
     );
 }
 

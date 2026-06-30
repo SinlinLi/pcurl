@@ -375,12 +375,19 @@ async fn try_fetch(
 ///
 /// Used when the server does not support ranges (or the size is unknown). Each
 /// frame takes a semaphore permit before being sent, providing back-pressure.
+///
+/// When `expected_len` is known (the probe saw a `Content-Length`), the total
+/// bytes received are checked at end-of-stream and a short body is reported as
+/// an error rather than a clean finish — so a transfer truncated by an early
+/// connection close is not mistaken for success. Without a `Content-Length` the
+/// body is connection-close-delimited and a truncation is undetectable.
 pub async fn run_single_stream(
     client: Client,
     url: String,
     sem: Arc<Semaphore>,
     tx: UnboundedSender<ChunkMsg>,
     token: CancellationToken,
+    expected_len: Option<u64>,
 ) -> Result<()> {
     let resp = client
         .get(&url)
@@ -392,9 +399,16 @@ pub async fn run_single_stream(
         token.cancel();
         bail!("unexpected status {status} for {url}");
     }
+    if expected_len.is_none() {
+        tracing::debug!(
+            "single-stream response has no Content-Length; a body truncated by an early \
+             connection close cannot be detected by length"
+        );
+    }
 
     let mut stream = resp.bytes_stream();
     let mut index: u64 = 0;
+    let mut received: u64 = 0;
     loop {
         let item = tokio::select! {
             _ = token.cancelled() => return Ok(()),
@@ -412,6 +426,7 @@ pub async fn run_single_stream(
                 return Err(anyhow::Error::new(e).context("error reading response body"));
             }
         };
+        received = received.saturating_add(bytes.len() as u64);
         if bytes.is_empty() {
             continue;
         }
@@ -434,6 +449,18 @@ pub async fn run_single_stream(
             return Ok(()); // writer gone
         }
         index += 1;
+    }
+    // The stream ended cleanly (None). If the probe told us how many bytes to
+    // expect, a short total means the body was truncated by an early connection
+    // close — report it as a failure instead of a successful download.
+    if let Some(expected) = expected_len {
+        if received < expected {
+            token.cancel();
+            bail!(
+                "single-stream body truncated: received {received} of {expected} bytes \
+                 (connection closed before the full Content-Length arrived)"
+            );
+        }
     }
     drop(tx);
     Ok(())

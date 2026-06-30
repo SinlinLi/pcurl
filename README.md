@@ -13,6 +13,45 @@ order inside a bounded in-memory buffer, and writes the original byte stream to
 stdout. The byte order on stdout is identical to the source file, so the output
 is safe to pipe into `zstd`, `gzip`, `tar`, or any streaming consumer.
 
+## When to use it
+
+You have a large compressed archive — a dataset, a model checkpoint, a backup —
+and you need to extract it on a machine that doesn't have room for both the
+archive *and* its contents. The standard trick streams the download straight
+into a decompressor so the compressed file never lands on disk:
+
+```sh
+curl https://host/huge.tar.zst | zstd -d | tar x
+```
+
+That keeps disk usage to just the extracted files — but `curl` pulls over a
+single connection. Against a per-connection rate limit (or on a fat, high-latency
+link a single TCP flow can't fill), a multi-terabyte archive can take days.
+
+Parallel downloaders (`aria2c`, `axel`, ...) fetch over many connections, but
+they write the file to disk — putting the whole archive back on the disk you
+were trying to avoid.
+
+`pcurl` is the missing combination: it fetches over many connections in parallel
+*and* streams the result strictly in order to stdout, so it drops into the exact
+same pipe:
+
+```sh
+pcurl https://host/huge.tar.zst | zstd -d | tar x
+```
+
+|                         | streams to a pipe (no archive on disk) | parallel connections |
+| ----------------------- | :---: | :---: |
+| `curl \| zstd \| tar`   | yes   | no    |
+| `aria2c`, `axel`        | no    | yes   |
+| `pcurl \| zstd \| tar`  | yes   | yes   |
+
+You get parallel throughput with curl's streaming model: the compressed archive
+is never stored, only the extracted output touches disk. Memory stays bounded (a
+small fixed buffer regardless of archive size), and if the decompressor or disk
+can't keep up, the pipe back-pressures the download automatically — so a space-
+or memory-limited box stays within its limits.
+
 ## Features
 
 - Multi-connection range download: N workers fetch `Range` chunks in parallel, over HTTP/1.1 by default so each is an independent TCP connection (`--http2` to multiplex onto one instead).
@@ -116,8 +155,10 @@ cleanly.
 
 A clean download exits `0`; a download that fails (an unrecoverable chunk error,
 or all bytes not written) exits non-zero. A consumer closing the pipe early is a
-success for pcurl. In a shell pipeline the overall status is the last stage's, so
-use `set -o pipefail` and check pcurl's own status to catch a download failure:
+success for pcurl. A termination signal (SIGINT/SIGTERM) cancels the run and
+exits `130`; since there is no resume, an interrupted download must be restarted.
+In a shell pipeline the overall status is the last stage's, so use
+`set -o pipefail` and check pcurl's own status to catch a download failure:
 
 ```sh
 set -o pipefail

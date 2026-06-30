@@ -39,4 +39,8 @@ rand = "0.8"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Unwind on panic so a panic in the spawn_blocking writer or a worker task is
+# caught as a JoinError and reported as a clean exit-1 with context, rather than
+# SIGABRT-ing the whole process. The transfer is network-I/O bound, so the cost
+# of unwind tables over abort is irrelevant here.
+panic = "unwind"

@@ -10,6 +10,7 @@ mod writer;
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -24,6 +25,10 @@ use crate::plan::ChunkPlan;
 use crate::probe::Probe;
 use crate::progress::Progress;
 use crate::writer::{ChunkMsg, WriterOutcome};
+
+/// Set when a termination signal is caught, so the process can exit non-zero
+/// even on a code path that would otherwise wind down to a clean result.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let cli = Cli::parse();
@@ -49,17 +54,68 @@ fn main() {
     // Shut the runtime down before exiting so background tasks stop cleanly.
     drop(runtime);
 
-    let code = match result {
-        Ok(()) => 0,
-        Err(e) => {
-            tracing::error!(error = format!("{e:#}"), "download failed");
-            eprintln!("pcurl: error: {e:#}");
-            1
+    let code = if INTERRUPTED.load(Ordering::Relaxed) {
+        // A termination signal cut the run short; the partial transfer is a
+        // failure regardless of which wind-down path produced `result`.
+        130
+    } else {
+        match result {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "download failed");
+                eprintln!("pcurl: error: {e:#}");
+                1
+            }
         }
     };
 
     drop(guard); // flush rotating-file logs
     std::process::exit(code);
+}
+
+/// Wait for the first termination signal and return its name. On Unix this
+/// covers SIGINT and SIGTERM (so `kill` / `systemctl stop` are handled, not
+/// just Ctrl-C); elsewhere it waits on Ctrl-C alone.
+async fn wait_for_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = term.recv() => "SIGTERM",
+            },
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "interrupt"
+    }
+}
+
+/// Spawn a task that, on the first termination signal, records the interruption,
+/// logs an attributable message, and cancels the run so workers and the writer
+/// wind down instead of being killed by the default signal disposition. The
+/// task also exits on its own once `token` is cancelled by normal completion.
+fn spawn_signal_handler(token: CancellationToken) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {}
+            name = wait_for_signal() => {
+                INTERRUPTED.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    signal = name,
+                    "terminated by signal; partial download — no resume, restart required"
+                );
+                token.cancel();
+            }
+        }
+    });
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -136,7 +192,7 @@ async fn run(cli: Cli) -> Result<()> {
             );
             let url = cli.url.clone();
             pipeline(out, None, len, show_progress, sem, move |tx, token, sem| {
-                download::run_single_stream(client, url, sem, tx, token)
+                download::run_single_stream(client, url, sem, tx, token, len)
             })
             .await
         }
@@ -158,6 +214,7 @@ where
     Fut: Future<Output = Result<()>>,
 {
     let token = CancellationToken::new();
+    spawn_signal_handler(token.clone());
     let (tx, rx) = mpsc::unbounded_channel::<ChunkMsg>();
     let progress = Progress::new(progress_total, show_progress);
     let reporter = progress.spawn_reporter(token.clone());
