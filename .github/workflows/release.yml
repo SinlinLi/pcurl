@@ -28,9 +28,26 @@ jobs:
             exit 1
           fi
 
+  create-release:
+    name: create GitHub Release
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # upload-rust-binary-action uploads to an EXISTING release, so create it
+      # once here (idempotent) before the build matrix attaches the binaries.
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Static musl binaries for x86_64 and aarch64 are attached below. See CHANGELOG.md for details."
+
   build:
     name: ${{ matrix.target }}
-    needs: verify-version
+    needs: create-release
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -45,7 +62,7 @@ jobs:
           targets: ${{ matrix.target }}
       # Builds a static musl binary (cross-compiling aarch64 via `cross`),
       # packages it as pcurl-<tag>-<target>.tar.gz with a .sha256, and uploads
-      # it to the GitHub Release for this tag (creating the release if needed).
+      # it to the GitHub Release created above.
       - name: Build and upload
         uses: taiki-e/upload-rust-binary-action@v1
         with:
