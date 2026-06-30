@@ -1,0 +1,57 @@
+name: Release
+
+# Cut a release by bumping `version` in Cargo.toml, committing, then tagging:
+#   git tag v0.2.0 && git push origin v0.2.0
+# The tag must match the Cargo.toml version or the build fails fast.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write # create the GitHub Release and upload assets
+
+jobs:
+  verify-version:
+    name: verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must equal Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "tag=$tag  cargo=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify-version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Builds a static musl binary (cross-compiling aarch64 via `cross`),
+      # packages it as pcurl-<tag>-<target>.tar.gz with a .sha256, and uploads
+      # it to the GitHub Release for this tag (creating the release if needed).
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: pcurl
+          target: ${{ matrix.target }}
+          archive: pcurl-$tag-$target
+          include: LICENSE,README.md
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

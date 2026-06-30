@@ -27,6 +27,12 @@ cargo fmt --check                           # CI enforces formatting
   and take ~15-20s; the `tar.zst` pipeline test (`tests/complex_pipeline.rs`)
   needs `zstd` on PATH. CI runs `cargo test --all -- --test-threads=2`.
 
+Releasing: bump `version` in `Cargo.toml`, commit, then push a matching tag
+(`git tag v0.2.0 && git push origin v0.2.0`). `.github/workflows/release.yml`
+verifies the tag equals the Cargo.toml version, builds static musl binaries
+(x86_64 + aarch64) and uploads them to the GitHub Release. Pushing to a branch
+runs `ci.yml` only (lint/test/build) — it never publishes.
+
 ## Architecture
 
 One streaming pipeline, assembled in `main.rs::run` -> `pipeline`:
