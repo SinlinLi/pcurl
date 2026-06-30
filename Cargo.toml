@@ -1,0 +1,42 @@
+[package]
+name = "pcurl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Parallel HTTP downloader that streams strictly in order to stdout, ready to pipe into a decompressor."
+license = "MIT"
+repository = "https://github.com/SinlinLi/pcurl"
+readme = "README.md"
+keywords = ["download", "http", "parallel", "streaming", "cli"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "pcurl"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "signal"] }
+# No gzip/brotli/deflate: this is a byte-exact range downloader, so transparent
+# content-decoding must stay off. With those features reqwest would advertise
+# Accept-Encoding and decode response bodies, which corrupts per-range bytes.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+[dev-dependencies]
+tiny_http = "0.12"
+tempfile = "3"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
