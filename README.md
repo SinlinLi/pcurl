@@ -48,7 +48,7 @@ Common options:
 | `-r, --retries <N>` | `20` | Per-chunk retry attempts; used only when `--retry-max-secs 0`. |
 | `--retry-max-secs <SECS>` | `300` | Per-chunk wall-clock retry budget: a chunk keeps retrying a transient failure until this elapses, so a fast-refusing outage does not abort the run as quickly as a fixed attempt count (`0` = use `--retries`). |
 | `-t, --timeout <SECS>` | `60` | Connect + idle (read) timeout; resets per read, so it bounds stalls without killing a slow transfer (`0` disables). |
-| `--min-speed <SIZE>` | `8K` | Minimum sustained per-chunk speed; a chunk below it for ~15s is dropped and retried so a trickling connection cannot wedge the stream (`0` disables). Raise it (e.g. `1M`) on a fast link to re-dispatch merely-slow edges. |
+| `--min-speed <SIZE>` | `8K` | Minimum sustained per-chunk speed; a chunk averaging below it over `--min-speed-window` (default `15`s) is dropped and retried so a trickling connection cannot wedge the stream (`0` disables). To re-dispatch a merely-slow (not stalled) edge on a fast link, raise this (e.g. `1M`) and set `--min-speed-window` below a healthy chunk's transfer time. |
 | `-o, --output <FILE>` | stdout | Write to a file instead of stdout. |
 | `--single` | off | Force a single straight-through stream. |
 | `--http2` | off | Use HTTP/2 if the server offers it. By default pcurl forces HTTP/1.1 so each connection is a separate TCP flow; over HTTP/2 the workers multiplex onto one connection and cannot beat per-connection rate limits. |
@@ -138,10 +138,14 @@ recent `--log-keep` files.
 ## Development
 
 ```sh
-cargo test            # unit + integration + end-to-end (tar.zst pipeline)
+cargo test                       # unit + integration + end-to-end (needs zstd for the pipeline test)
+cargo test --test e2e <name>     # one end-to-end test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+The integration tests drive the compiled binary against a local `tiny_http`
+server (`tests/common`) and run serially, so the full suite takes ~15-20s.
 
 ## License
 
