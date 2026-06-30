@@ -6,10 +6,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::header::RANGE;
 use reqwest::{Client, StatusCode};
@@ -21,12 +21,23 @@ use tokio_util::sync::CancellationToken;
 use crate::plan::ChunkPlan;
 use crate::writer::ChunkMsg;
 
+/// Upper bound on per-chunk buffer pre-allocation, so a very large `--chunk-size`
+/// cannot reserve an unreasonable amount up front. The buffer still grows as the
+/// body arrives; this only caps the initial reservation.
+const MAX_PREALLOC: u64 = 16 * 1024 * 1024;
+
 /// Retry / backoff policy for a single chunk.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryCfg {
     pub retries: u32,
     pub backoff_ms: u64,
     pub backoff_max_ms: u64,
+    /// Minimum sustained chunk throughput in bytes/s; `0` disables the floor.
+    /// A chunk below this for a full window is dropped and retried so one
+    /// trickling connection cannot stall the strictly in-order writer.
+    pub min_speed: u64,
+    /// Window in seconds over which `min_speed` is averaged.
+    pub min_speed_window_secs: u64,
 }
 
 impl RetryCfg {
@@ -199,7 +210,17 @@ async fn fetch_chunk(
         if token.is_cancelled() {
             bail!("cancelled");
         }
-        let last_err: anyhow::Error = match try_fetch(client, url, start, end).await {
+        let last_err: anyhow::Error = match try_fetch(
+            client,
+            url,
+            start,
+            end,
+            expected,
+            retry.min_speed,
+            retry.min_speed_window_secs,
+        )
+        .await
+        {
             Ok(bytes) if bytes.len() as u64 == expected => return Ok(bytes),
             Ok(bytes) => anyhow!("short read: got {} bytes, expected {expected}", bytes.len()),
             Err(FetchError::Transport(e)) => e,
@@ -232,7 +253,23 @@ async fn fetch_chunk(
 }
 
 /// Single attempt: request the range and read exactly that range's body.
-async fn try_fetch(client: &Client, url: &str, start: u64, end: u64) -> Result<Bytes, FetchError> {
+///
+/// The body is read as a stream so a minimum-throughput floor can be enforced.
+/// The connect/idle timeout only bounds a *total* stall; a connection trickling
+/// a few bytes per read keeps resetting it and never fails. When `min_speed > 0`,
+/// a sliding window checks sustained throughput and fails the attempt (so the
+/// retry loop re-dispatches the chunk, typically onto a fresh connection) if it
+/// stays below the floor — preventing one slow edge from wedging the whole stream.
+async fn try_fetch(
+    client: &Client,
+    url: &str,
+    start: u64,
+    end: u64,
+    expected: u64,
+    min_speed: u64,
+    window_secs: u64,
+) -> Result<Bytes, FetchError> {
+    let window = Duration::from_secs(window_secs.max(1));
     let resp = client
         .get(url)
         .header(RANGE, format!("bytes={start}-{end}"))
@@ -245,9 +282,37 @@ async fn try_fetch(client: &Client, url: &str, start: u64, end: u64) -> Result<B
         // Drop the body unread; never buffer a potentially huge 200 body.
         return Err(FetchError::Status(status));
     }
-    resp.bytes()
-        .await
-        .map_err(|e| FetchError::Transport(anyhow::Error::new(e).context("reading chunk body")))
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = BytesMut::with_capacity(expected.min(MAX_PREALLOC) as usize);
+    // Start the throughput window on the first body frame, not here: the gap
+    // until first byte (connection warm-up, a cold-storage range assemble) is
+    // not transfer-rate and must not be charged against `min_speed`.
+    let mut window_start: Option<Instant> = None;
+    let mut window_bytes: u64 = 0;
+    let min_per_window = min_speed.saturating_mul(window.as_secs());
+
+    while let Some(item) = stream.next().await {
+        let bytes = item.map_err(|e| {
+            FetchError::Transport(anyhow::Error::new(e).context("reading chunk body"))
+        })?;
+        window_bytes = window_bytes.saturating_add(bytes.len() as u64);
+        buf.extend_from_slice(&bytes);
+
+        let start = *window_start.get_or_insert_with(Instant::now);
+        if min_speed > 0 && start.elapsed() >= window {
+            if window_bytes < min_per_window {
+                return Err(FetchError::Transport(anyhow!(
+                    "chunk too slow: {window_bytes} bytes in {}s is below --min-speed ({min_speed} B/s)",
+                    window.as_secs(),
+                )));
+            }
+            window_start = Some(Instant::now());
+            window_bytes = 0;
+        }
+    }
+
+    Ok(buf.freeze())
 }
 
 /// Stream the whole resource as one ordered sequence of frames.

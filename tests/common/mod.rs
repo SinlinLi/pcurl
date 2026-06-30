@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -46,6 +46,10 @@ pub enum Mode {
     /// Like NoRange, but drip the 200 body slowly in pieces (exercises the
     /// idle/read timeout vs a total request timeout on the single-stream path).
     SlowNoRange,
+    /// Like Range, but the first time it sees each distinct range it trickles
+    /// the 206 body far below any sane `--min-speed`, then serves it at full
+    /// speed on retry (exercises the throughput floor re-dispatching a chunk).
+    TrickleFirstChunk,
 }
 
 pub struct TestServer {
@@ -54,6 +58,7 @@ pub struct TestServer {
     stop: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
     accept_encoding: Arc<Mutex<Vec<String>>>,
+    chunk_requests: Arc<AtomicU64>,
 }
 
 impl TestServer {
@@ -67,6 +72,7 @@ impl TestServer {
         let stop = Arc::new(AtomicBool::new(false));
         let seen: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
         let accept_encoding: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let chunk_requests = Arc::new(AtomicU64::new(0));
 
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -75,15 +81,21 @@ impl TestServer {
             let stop = Arc::clone(&stop);
             let seen = Arc::clone(&seen);
             let accept_encoding = Arc::clone(&accept_encoding);
+            let chunk_requests = Arc::clone(&chunk_requests);
             // Poll with a timeout so every worker re-checks the stop flag and
             // exits promptly on teardown. (`Server::unblock` only wakes one
             // blocked `recv`, which would hang the join with several workers.)
             handles.push(thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match server.recv_timeout(Duration::from_millis(100)) {
-                        Ok(Some(request)) => {
-                            handle_request(request, &data, mode, &seen, &accept_encoding)
-                        }
+                        Ok(Some(request)) => handle_request(
+                            request,
+                            &data,
+                            mode,
+                            &seen,
+                            &accept_encoding,
+                            &chunk_requests,
+                        ),
                         Ok(None) => continue,
                         Err(_) => break,
                     }
@@ -97,7 +109,14 @@ impl TestServer {
             stop,
             handles,
             accept_encoding,
+            chunk_requests,
         }
+    }
+
+    /// Number of real (non-probe) chunk range requests the server received.
+    /// Used to assert that a chunk was re-dispatched (requested more than once).
+    pub fn chunk_request_count(&self) -> u64 {
+        self.chunk_requests.load(Ordering::Relaxed)
     }
 
     /// All `Accept-Encoding` header values the server observed, in arrival order.
@@ -124,6 +143,7 @@ fn handle_request(
     mode: Mode,
     seen: &Mutex<HashSet<(u64, u64)>>,
     accept_encoding: &Mutex<Vec<String>>,
+    chunk_requests: &AtomicU64,
 ) {
     let total = data.len() as u64;
     if let Some(ae) = request
@@ -142,6 +162,9 @@ fn handle_request(
         .find(|h| h.field.equiv("Range"))
         .and_then(|h| parse_range(h.value.as_str(), total));
     let is_probe = matches!(range, Some((0, 0)));
+    if range.is_some() && !is_probe {
+        chunk_requests.fetch_add(1, Ordering::Relaxed);
+    }
 
     match mode {
         Mode::Empty416 => {
@@ -167,6 +190,19 @@ fn handle_request(
                     }
                 }
                 respond_range(request, data, start, end, total);
+            }
+            None => respond_full_200(request, data, true),
+        },
+        Mode::TrickleFirstChunk => match range {
+            Some((start, end)) => {
+                // First sight of a real chunk: drip it below --min-speed so the
+                // throughput floor drops it; the retry (range already seen) is
+                // served at full speed.
+                if !is_probe && seen.lock().unwrap().insert((start, end)) {
+                    trickle_range(request, data, start, end, total);
+                } else {
+                    respond_range(request, data, start, end, total);
+                }
             }
             None => respond_full_200(request, data, true),
         },
@@ -200,6 +236,26 @@ fn respond_range(request: tiny_http::Request, data: &[u8], start: u64, end: u64,
         ))
         .with_header(header("Accept-Ranges", "bytes"))
         .with_header(header("Connection", "close"));
+    let _ = request.respond(resp);
+}
+
+/// Respond 206 for the range but drip the body at roughly 10 KiB/s, far below
+/// any sane `--min-speed`, so the throughput floor drops and re-dispatches it.
+fn trickle_range(request: tiny_http::Request, data: &[u8], start: u64, end: u64, total: u64) {
+    let slice = data[start as usize..=end as usize].to_vec();
+    let len = slice.len();
+    let reader = SlowReader::new(slice, 2 * 1024, Duration::from_millis(200));
+    let resp = Response::new(
+        tiny_http::StatusCode(206),
+        vec![
+            header("Content-Range", &format!("bytes {start}-{end}/{total}")),
+            header("Accept-Ranges", "bytes"),
+            header("Connection", "close"),
+        ],
+        reader,
+        Some(len),
+        None,
+    );
     let _ = request.respond(resp);
 }
 

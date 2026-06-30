@@ -110,6 +110,56 @@ fn per_chunk_retry_recovers() {
 }
 
 #[test]
+fn min_speed_floor_redispatches_trickling_chunk() {
+    let _g = common::serial_guard();
+    // Each chunk is trickled (~10 KiB/s) on first sight, then served fast on
+    // retry. A 1 MiB/s floor over a 1s window drops the slow attempt; the retry
+    // recovers it, so the final output is still byte-exact.
+    let data = random_bytes(256 * 1024, 7);
+    let num_chunks = 256 / 64; // 64K chunks
+    let server = TestServer::start(data.clone(), Mode::TrickleFirstChunk);
+    let got = run_capture(
+        &server.url,
+        &[
+            "-c",
+            "4",
+            "-s",
+            "64K",
+            "--min-speed",
+            "1M",
+            "--min-speed-window",
+            "1",
+            "-r",
+            "5",
+        ],
+    );
+    assert_bytes_eq(&got, &data, "min_speed_trickle");
+    // The byte-exact check alone would pass even with the floor disabled (the
+    // trickle delivers the full body, just slowly). Assert the floor actually
+    // fired: every chunk's first (trickled) attempt was dropped and re-fetched,
+    // so each range was requested at least twice.
+    let reqs = server.chunk_request_count();
+    assert!(
+        reqs >= 2 * num_chunks,
+        "expected each of {num_chunks} chunks re-dispatched (>= {} requests), got {reqs}; \
+         the min-speed floor did not fire",
+        2 * num_chunks
+    );
+}
+
+#[test]
+fn http2_flag_downloads_byte_exact() {
+    let _g = common::serial_guard();
+    // Exercises the --http2 client-build branch (which skips http1_only). The
+    // bundled server is HTTP/1.1, so this also covers a clean ALPN downgrade:
+    // the download must still be byte-exact.
+    let data = random_bytes(512 * 1024, 8);
+    let server = TestServer::start(data.clone(), Mode::Range);
+    let got = run_capture(&server.url, &["-c", "4", "-s", "64K", "--http2"]);
+    assert_bytes_eq(&got, &data, "http2_flag");
+}
+
+#[test]
 fn small_file_byte_exact() {
     let _g = common::serial_guard();
     let data = b"hello, pcurl!".to_vec();

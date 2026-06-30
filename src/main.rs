@@ -63,7 +63,7 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let client = probe::build_client(&cli.user_agent, cli.timeout, &cli.headers)?;
+    let client = probe::build_client(&cli.user_agent, cli.timeout, &cli.headers, cli.http2)?;
 
     let out: Box<dyn Write + Send> = match &cli.output {
         Some(path) => Box::new(
@@ -86,6 +86,8 @@ async fn run(cli: Cli) -> Result<()> {
         retries: cli.retries,
         backoff_ms: cli.backoff_ms,
         backoff_max_ms: cli.backoff_max_ms,
+        min_speed: cli.min_speed,
+        min_speed_window_secs: cli.min_speed_window,
     };
 
     match probed {
@@ -198,14 +200,65 @@ where
 fn finalize(producer_res: Result<()>, writer_res: std::io::Result<WriterOutcome>) -> Result<()> {
     match writer_res {
         Ok(WriterOutcome::BrokenPipe) => {
-            // Consumer closed the pipe (e.g. `| head`). Expected, not an error.
-            tracing::info!("output closed by consumer (broken pipe); stopped early");
-            Ok(())
+            // Consumer closed the pipe. For a voluntary early stop (e.g. `| head`)
+            // the producer is fine and this is a clean success. But if a worker hit
+            // a fatal error at the same time, surface that instead of letting the
+            // closed pipe mask a real download failure as success.
+            if producer_res.is_err() {
+                producer_res
+            } else {
+                tracing::info!("output closed by consumer (broken pipe); stopped early");
+                Ok(())
+            }
         }
         Ok(WriterOutcome::Complete) => producer_res,
         Ok(WriterOutcome::Incomplete) => {
             producer_res.and(Err(anyhow!("download ended before all bytes were written")))
         }
         Err(io_err) => Err(anyhow::Error::new(io_err).context("failed writing output")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finalize;
+    use crate::writer::WriterOutcome;
+    use anyhow::anyhow;
+
+    fn io_err() -> std::io::Result<WriterOutcome> {
+        Err(std::io::Error::other("disk full"))
+    }
+
+    #[test]
+    fn broken_pipe_with_producer_ok_is_clean_success() {
+        // `| head` and friends: consumer stopped early, producer is fine.
+        assert!(finalize(Ok(()), Ok(WriterOutcome::BrokenPipe)).is_ok());
+    }
+
+    #[test]
+    fn broken_pipe_does_not_mask_producer_error() {
+        // A consumer that died on a concurrent fatal producer error must surface
+        // that error, not be reported as success.
+        assert!(finalize(
+            Err(anyhow!("range fetch failed")),
+            Ok(WriterOutcome::BrokenPipe)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn complete_propagates_producer_result() {
+        assert!(finalize(Ok(()), Ok(WriterOutcome::Complete)).is_ok());
+        assert!(finalize(Err(anyhow!("boom")), Ok(WriterOutcome::Complete)).is_err());
+    }
+
+    #[test]
+    fn incomplete_is_error_even_when_producer_ok() {
+        assert!(finalize(Ok(()), Ok(WriterOutcome::Incomplete)).is_err());
+    }
+
+    #[test]
+    fn writer_io_error_is_error() {
+        assert!(finalize(Ok(()), io_err()).is_err());
     }
 }

@@ -15,7 +15,7 @@ is safe to pipe into `zstd`, `gzip`, `tar`, or any streaming consumer.
 
 ## Features
 
-- Multi-connection range download: N workers fetch `Range` chunks in parallel.
+- Multi-connection range download: N workers fetch `Range` chunks in parallel, over HTTP/1.1 by default so each is an independent TCP connection (`--http2` to multiplex onto one instead).
 - Strict in-order output: out-of-order chunks are reordered before they reach stdout.
 - Bounded memory: peak usage is about `max_buffered * chunk_size`, regardless of download speed.
 - Pipe friendly: data on stdout, progress on stderr, clean stop on a broken pipe.
@@ -44,11 +44,13 @@ Common options:
 | --- | --- | --- |
 | `-c, --connections <N>` | `8` | Parallel connections (workers). |
 | `-s, --chunk-size <SIZE>` | `8M` | Range chunk size (`4M`, `512K`, `1048576`). |
-| `--max-buffered <N>` | `= connections` | Max chunks held in memory; peak memory `~= N * chunk_size`. |
-| `-r, --retries <N>` | `5` | Per-chunk retry attempts after the first failure. |
+| `--max-buffered <N>` | `= 2 × connections` | Max chunks held in memory; peak memory `~= N * chunk_size`. The read-ahead keeps one slow chunk from stalling the in-order writer. |
+| `-r, --retries <N>` | `20` | Per-chunk retry attempts after the first failure; sized so a transient origin/CDN blip does not abort a long transfer. |
 | `-t, --timeout <SECS>` | `60` | Connect + idle (read) timeout; resets per read, so it bounds stalls without killing a slow transfer (`0` disables). |
+| `--min-speed <SIZE>` | `8K` | Minimum sustained per-chunk speed; a chunk below it for ~15s is dropped and retried so a trickling connection cannot wedge the stream (`0` disables). Raise it (e.g. `1M`) on a fast link to re-dispatch merely-slow edges. |
 | `-o, --output <FILE>` | stdout | Write to a file instead of stdout. |
 | `--single` | off | Force a single straight-through stream. |
+| `--http2` | off | Use HTTP/2 if the server offers it. By default pcurl forces HTTP/1.1 so each connection is a separate TCP flow; over HTTP/2 the workers multiplex onto one connection and cannot beat per-connection rate limits. |
 | `-H, --header <H>` | none | Extra request header (`"Name: value"`), repeatable. |
 | `-q, --quiet` | off | Suppress the stderr progress line. |
 | `-v, --verbose` | off | More logs on stderr (`-v`, `-vv`); `RUST_LOG` overrides. |
@@ -108,6 +110,22 @@ never stalls.
 When the consumer closes the output early (for example `| head`), the next write
 fails with a broken pipe; the writer cancels all workers and the process exits
 cleanly.
+
+## Exit status in pipelines
+
+A clean download exits `0`; a download that fails (an unrecoverable chunk error,
+or all bytes not written) exits non-zero. A consumer closing the pipe early is a
+success for pcurl. In a shell pipeline the overall status is the last stage's, so
+use `set -o pipefail` and check pcurl's own status to catch a download failure:
+
+```sh
+set -o pipefail
+pcurl https://example.com/huge.tar.zst | zstd -d | tar x
+echo "pcurl=${PIPESTATUS[0]} zstd=${PIPESTATUS[1]} tar=${PIPESTATUS[2]}"
+```
+
+A downstream tool that dies on its own (for example `tar x` running out of disk)
+surfaces through its own exit code, not pcurl's.
 
 ## Logging
 

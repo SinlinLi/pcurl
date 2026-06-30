@@ -21,6 +21,7 @@ pub fn build_client(
     user_agent: &str,
     timeout_secs: u64,
     extra_headers: &[String],
+    http2: bool,
 ) -> Result<Client> {
     let mut headers = HeaderMap::new();
     for raw in extra_headers {
@@ -38,6 +39,13 @@ pub fn build_client(
         .user_agent(user_agent)
         .default_headers(headers)
         .redirect(reqwest::redirect::Policy::limited(10));
+    if !http2 {
+        // Force HTTP/1.1 so each concurrent range request rides its own TCP
+        // connection, giving real N-way parallelism that can beat per-connection
+        // rate limits. Over HTTP/2 reqwest multiplexes every worker onto a
+        // single connection, collapsing the parallelism back to one flow.
+        builder = builder.http1_only();
+    }
     if timeout_secs > 0 {
         // Use connect + read (idle) timeouts, NOT a total request timeout. The
         // single-stream fallback reads one long-lived response body; a total
@@ -70,7 +78,7 @@ pub async fn probe(client: &Client, url: &str) -> Result<Probe> {
             .and_then(|v| v.to_str().ok())
             .and_then(parse_content_range_total)
         {
-            tracing::debug!(total, "server supports ranges (206)");
+            tracing::debug!(total, version = ?resp.version(), "server supports ranges (206)");
             return Ok(Probe::Ranged { total });
         }
         // 206 without a usable total — cannot plan chunks; stream as one.
@@ -97,6 +105,7 @@ pub async fn probe(client: &Client, url: &str) -> Result<Probe> {
         tracing::debug!(
             accept_ranges = accepts,
             content_length = ?len,
+            version = ?resp.version(),
             "server returned {status}; using single stream",
         );
         return Ok(Probe::Single { len });

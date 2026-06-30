@@ -28,19 +28,37 @@ pub struct Cli {
 
     /// Maximum number of chunks held in memory at once (downloading + buffered).
     ///
-    /// Peak memory is roughly `max_buffered * chunk_size`. Defaults to the
-    /// number of connections, keeping memory at about `connections * chunk_size`.
+    /// Peak memory is roughly `max_buffered * chunk_size`. Defaults to twice the
+    /// number of connections, giving each connection one chunk of read-ahead so a
+    /// single slow chunk cannot stall the in-order writer and collapse throughput.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=65536))]
     pub max_buffered: Option<u32>,
 
-    /// Per-chunk retry attempts after the first failure.
-    #[arg(short = 'r', long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(0..=100))]
+    /// Per-chunk retry attempts after the first failure. The default is sized
+    /// for long unattended transfers: with no resume, a chunk's retries are the
+    /// only thing that rides out a transient origin/CDN blip, so a single hiccup
+    /// does not abort the whole download.
+    #[arg(short = 'r', long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(0..=1000))]
     pub retries: u32,
 
     /// Connect and idle (read) timeout in seconds; resets on each read, so it
     /// bounds stalls without aborting a healthy slow transfer (0 disables it).
     #[arg(short = 't', long, default_value_t = 60)]
     pub timeout: u64,
+
+    /// Minimum sustained per-chunk download speed (e.g. `64K`, `1M`); `0`
+    /// disables it. A chunk whose throughput stays below this for ~15s is
+    /// dropped and retried, so one trickling connection cannot wedge the
+    /// strictly in-order stream. The default catches stalled/trickling
+    /// connections; raise it (e.g. `1M`) on a fast link to also re-dispatch
+    /// merely-slow edges. Applies to ranged parallel downloads only.
+    #[arg(long, value_parser = parse_min_speed, default_value = "8K")]
+    pub min_speed: u64,
+
+    /// Window in seconds over which `--min-speed` is averaged before a chunk is
+    /// judged too slow. A shorter window reacts faster but tolerates less jitter.
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub min_speed_window: u64,
 
     /// Base backoff in milliseconds; doubles each retry up to `backoff_max_ms`.
     #[arg(long, default_value_t = 200)]
@@ -57,6 +75,13 @@ pub struct Cli {
     /// Force a single straight-through stream (no range parallelism).
     #[arg(long)]
     pub single: bool,
+
+    /// Use HTTP/2 when the server offers it (ALPN). By default pcurl forces
+    /// HTTP/1.1 so each parallel connection is a separate TCP flow; over HTTP/2
+    /// the workers multiplex onto one TCP connection, which cannot beat
+    /// per-connection rate limits.
+    #[arg(long)]
+    pub http2: bool,
 
     /// HTTP header to send, repeatable. Format: "Name: value".
     #[arg(short = 'H', long = "header", value_name = "HEADER")]
@@ -87,10 +112,18 @@ pub struct Cli {
     pub user_agent: String,
 }
 
+/// Default read-ahead: hold this many chunks per connection so a single slow
+/// chunk at the write head cannot starve the other connections of buffer slots.
+const READAHEAD_FACTOR: u32 = 2;
+
 impl Cli {
     /// Effective in-memory chunk budget.
     pub fn max_buffered(&self) -> u32 {
-        self.max_buffered.unwrap_or(self.connections)
+        self.max_buffered.unwrap_or_else(|| {
+            self.connections
+                .saturating_mul(READAHEAD_FACTOR)
+                .clamp(1, 65536)
+        })
     }
 }
 
@@ -121,6 +154,15 @@ fn parse_size(input: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// Parse a `--min-speed` value: a byte size like `parse_size`, plus a literal
+/// `0` to disable the throughput floor.
+fn parse_min_speed(input: &str) -> Result<u64, String> {
+    if input.trim() == "0" {
+        return Ok(0);
+    }
+    parse_size(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_size;
@@ -140,5 +182,24 @@ mod tests {
         assert!(parse_size("0").is_err());
         assert!(parse_size("abc").is_err());
         assert!(parse_size("12x").is_err());
+    }
+
+    #[test]
+    fn min_speed_allows_zero_and_suffixes() {
+        use super::parse_min_speed;
+        assert_eq!(parse_min_speed("0").unwrap(), 0);
+        assert_eq!(parse_min_speed("8K").unwrap(), 8 * 1024);
+        assert_eq!(parse_min_speed("1M").unwrap(), 1024 * 1024);
+        assert!(parse_min_speed("nope").is_err());
+    }
+
+    #[test]
+    fn max_buffered_defaults_to_twice_connections() {
+        use clap::Parser;
+        let cli = super::Cli::parse_from(["pcurl", "-c", "8", "http://x"]);
+        assert_eq!(cli.max_buffered(), 16);
+        // An explicit value overrides the read-ahead default.
+        let cli = super::Cli::parse_from(["pcurl", "-c", "8", "--max-buffered", "5", "http://x"]);
+        assert_eq!(cli.max_buffered(), 5);
     }
 }
